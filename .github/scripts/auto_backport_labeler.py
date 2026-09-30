@@ -154,6 +154,44 @@ def is_feature_pr(title: str, labels: list[str]=None, head_branch: str=None) -> 
     return False, "PR is a bugfix, maintenance, or non-feature change (eligible for backporting)"
 
 
+def was_commit_previously_backported(commit_sha: str, target_ref: str) -> tuple[bool, str]:
+    """
+    Checks if commit_sha (or its associated PR) was previously backported to target_ref.
+    """
+    # 1. Search git log on target branch for cherry-pick metadata referencing the commit SHA
+    rc, stdout, _ = run_cmd(["git", "log", target_ref, f"--grep={commit_sha}", "-n", "1", "--oneline"])
+    if rc == 0 and stdout:
+        return True, f"Commit {commit_sha[:9]} was previously backported in commit: {stdout}"
+
+    # 2. Search git log on target branch for backport PR title referencing the original PR number
+    rc, commit_msg, _ = run_cmd(["git", "log", "-1", "--format=%s%n%b", commit_sha])
+    if rc == 0 and commit_msg:
+        pr_matches = re.findall(r"#(\d+)", commit_msg)
+        for pr_num in pr_matches:
+            rc, stdout, _ = run_cmd(
+                ["git", "log", target_ref, f"--grep=backport.*#{pr_num}", "-n", "1", "--oneline"]
+            )
+            if rc == 0 and stdout:
+                return True, f"Original PR #{pr_num} was previously backported in commit: {stdout}"
+
+    return False, "No previous backport found in target branch log"
+
+
+def do_modified_lines_exist_in_target(target_ref: str, file_path: str, deleted_lines: list[str]) -> bool:
+    """
+    Checks if non-trivial lines being modified/deleted by the PR exist in target_ref:file_path.
+    """
+    rc, content, _ = run_cmd(["git", "show", f"{target_ref}:{file_path}"])
+    if rc != 0:
+        return False
+    target_lines = set(line.strip() for line in content.splitlines() if line.strip())
+    meaningful = [l.strip() for l in deleted_lines if len(l.strip()) > 3]
+    if not meaningful:
+        return False
+    matches = sum(1 for l in meaningful if l in target_lines)
+    return matches >= len(meaningful) * 0.5
+
+
 def verify_issue_presence_in_branch(commit: str, target_branch: str) -> tuple[bool, str]:
     """
     Verifies if the issue/problem addressed by commit is present in origin/<target_branch>.
@@ -171,9 +209,11 @@ def verify_issue_presence_in_branch(commit: str, target_branch: str) -> tuple[bo
        - Finds the fork point ('merge_base') where '<target_branch>' split from 'main'.
        - Inspects the lines modified by this PR ('git diff -U0').
        - Traces back who originally wrote those lines ('git blame').
-       - If those lines were added to 'main' AFTER '<target_branch>' split off,
-         then '<target_branch>' never had that code (and thus never had the bug).
-         In that case, backporting is skipped.
+       - If those lines were added to 'main' AFTER '<target_branch>' split off:
+         * Checks if the commit that introduced them was previously backported to '<target_branch>'.
+         * Checks if the lines being changed actually exist in '<target_branch>'.
+         * If neither is true, '<target_branch>' never had that code (and thus never had the bug),
+           so backporting is skipped.
 
     Args:
         commit: The commit hash to verify.
@@ -233,6 +273,11 @@ def verify_issue_presence_in_branch(commit: str, target_branch: str) -> tuple[bo
             if rc != 0:
                 continue
 
+            # Extract deleted lines in diff
+            deleted_lines = [
+                line[1:] for line in diff_out.splitlines() if line.startswith("-") and not line.startswith("---")
+            ]
+
             hunks = re.findall(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", diff_out)
             for h_start, h_count, _, _ in hunks:
                 start_line = int(h_start)
@@ -250,13 +295,23 @@ def verify_issue_presence_in_branch(commit: str, target_branch: str) -> tuple[bo
                 for c in set(line_commits):
                     rc_anc, _, _ = run_cmd(["git", "merge-base", "--is-ancestor", c, ref])
                     if rc_anc != 0:
-                        # c is not in target_branch. Was it introduced after merge_base?
+                        # c is not in target_branch ancestry. Was it introduced after merge_base?
                         rc_after, _, _ = run_cmd(["git", "merge-base", "--is-ancestor", merge_base, c])
                         if rc_after == 0 and c != merge_base:
+                            # Check if commit c was previously backported to target branch
+                            was_bp, bp_detail = was_commit_previously_backported(c, ref)
+                            if was_bp:
+                                print(f"  Target '{target_branch}': {bp_detail}")
+                                continue
+
+                            # Check if the modified lines exist in target branch file
+                            if do_modified_lines_exist_in_target(ref, f, deleted_lines):
+                                continue
+
                             return (
                                 False,
                                 f"Modified code in '{f}' (lines {start_line}-{start_line+count-1}) was introduced in commit {c[:9]}, "
-                                f"which post-dates the '{target_branch}' branch point and does not exist in '{target_branch}'.",
+                                f"which post-dates the '{target_branch}' branch point, was not previously backported, and does not exist in '{target_branch}'.",
                             )
 
     return True, f"Codebase and modified lines verified present in '{target_branch}'."
