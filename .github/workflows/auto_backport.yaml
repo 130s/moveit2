@@ -1,0 +1,68 @@
+name: Auto Backport Labeler
+
+on:
+  pull_request_target:
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to evaluate"
+        required: true
+        type: number
+      filter_branches:
+        description: "Optional comma-separated list of target branch names to evaluate (e.g. 'jazzy,humble' or 'humble')"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Dry run (do not add labels or post comments)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: read
+
+jobs:
+  auto-backport:
+    name: Evaluate and Label Backports
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        run: pip install pyyaml
+
+      - name: Evaluate PR and Apply Backport Labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.pull_request.number || inputs.pr_number }}"
+          FILTER_ARG=""
+          if [ -n "${{ inputs.filter_branches }}" ]; then
+            FILTER_ARG="--filter-branches ${{ inputs.filter_branches }}"
+          fi
+          DRY_RUN_ARG=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+
+          python3 .github/scripts/auto_backport_labeler.py \
+            --pr-number "$PR_NUM" \
+            $FILTER_ARG \
+            $DRY_RUN_ARG
